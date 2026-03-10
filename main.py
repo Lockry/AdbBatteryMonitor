@@ -12,8 +12,8 @@ DEVICES_FILE = BASE_DIR / "devices.txt"  # файл со списком IP:PORT
 EXCEL_FILE = BASE_DIR / "battery_log.xlsx"  # итоговый Excel файл
 
 POLL_INTERVAL_SEC = 5
-ADB_TIMEOUT_SEC = 5
-MAX_WORKERS = 10
+ADB_TIMEOUT_SEC = 60
+MAX_WORKERS = 16
 
 # Указываем локальный путь к adb.exe
 ADB_PATH = BASE_DIR / "platform-tools" / "adb.exe"
@@ -110,24 +110,36 @@ def poll_device(device: str) -> dict:
             "device": device,
             "voltage_mv": None,
             "current_ma": None,
+            "cpu_temp1": None,
+            "battery_temp1": None,
+            "battery_temp2": None,
             "status": "OFFLINE"
         }
 
     voltage_raw = adb_read(device, "/sys/class/power_supply/battery/voltage_now")
     current_raw = adb_read(device, "/sys/class/power_supply/battery/current_now")
+    cpu_temp1 = adb_read(device, "/sys/class/thermal/thermal_zone5/temp")
+    battery_temp1 = adb_read(device, "/sys/class/thermal/thermal_zone27/temp")
+    battery_temp2 = adb_read(device, "/sys/class/thermal/thermal_zone27/temp")
 
     if voltage_raw is None or current_raw is None:
         return {
             "device": device,
             "voltage_mv": None,
             "current_ma": None,
+            "cpu_temp1": None,
+            "battery_temp1": None,
+            "battery_temp2": None,
             "status": "NO_DATA"
         }
 
     return {
         "device": device,
-        "voltage_mv": voltage_raw // 1000,  # µV → mV
-        "current_ma": current_raw // 1000,  # µA → mA
+        "voltage_mv": voltage_raw // 1000,
+        "current_ma": current_raw // 1000,
+        "cpu_temp1": cpu_temp1 // 1000,
+        "battery_temp1": battery_temp1 // 1000,
+        "battery_temp2": battery_temp2 // 1000,
         "status": "OK"
     }
 
@@ -153,6 +165,9 @@ def init_excel(devices: list[str]) -> None:
             "Device",
             "Voltage (mV)",
             "Current (mA)",
+            "CPU temp(cpu_big1)",
+            "Battery Temp #1",
+            "Battery Temp #2",
             "Status",
             "Test Duration (sec)",
             "Capacity (mAh)"
@@ -248,6 +263,9 @@ def main() -> None:
                     result["device"],
                     result["voltage_mv"],
                     result["current_ma"],
+                    result["cpu_temp1"],
+                    result["battery_temp1"],
+                    result["battery_temp2"],
                     result["status"],
                 ]
 
@@ -256,6 +274,9 @@ def main() -> None:
                     f"{result['status']} "
                     f"V={result['voltage_mv']}mV "
                     f"I={result['current_ma']}mA"
+                    f"I={result['cpu_temp1']}C"
+                    f"I={result['battery_temp1']}C"
+                    f"I={result['battery_temp2']}C"
                 )
 
                 append_to_excel_sheet(result["device"], row)
