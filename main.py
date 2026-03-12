@@ -1,75 +1,159 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Battery/Power monitoring script for Android devices via ADB
+v2.0 — SQLite backend, one table per device (IP:PORT)
+"""
+
 import subprocess
 import time
 import threading
 import signal
-import shutil
+import sqlite3
+import logging
+import re
 from pathlib import Path
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from queue import Queue
-
-import openpyxl
-from openpyxl.styles import Font, Alignment, PatternFill
-from openpyxl.utils import get_column_letter
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
+from queue import Queue, Empty as QueueEmpty
 
 # ==================== CONFIG ====================
 BASE_DIR = Path(__file__).resolve().parent
 DEVICES_FILE = BASE_DIR / "devices.txt"
-EXCEL_FILE = BASE_DIR / "battery_log.xlsx"
-CSV_BACKUP_FILE = BASE_DIR / "battery_log_backup.csv"
+DB_FILE = BASE_DIR / "battery_log.db"
+LOG_FILE = BASE_DIR / "battery_monitor.log"
 
-POLL_INTERVAL_SEC = 5
-ADB_TIMEOUT_SEC = 60
-MAX_WORKERS = 12
+POLL_INTERVAL_SEC = 10
+ADB_TIMEOUT_SEC = 30
+MAX_WORKERS = 14
+DB_COMMIT_INTERVAL_SEC = 60  # Коммит в БД каждые 30 секунд
+DB_QUEUE_MAXSIZE = 3000  # Макс. размер очереди записи
 
 ADB_PATH = BASE_DIR / "platform-tools" / "adb.exe"
 
-# ==================== GLOBAL STATE ====================
-TEST_START_TIME = None
-CAPACITY_PER_DEVICE = {}
-_excel_write_lock = threading.Lock()
-_write_queue = Queue()
-_writer_thread = None
-_shutdown_flag = False
+# ==================== LOGGING ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8", mode="a"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 
-def ensure_adb_server_running() -> None:
-    """Перезапускает ADB сервер для чистого состояния"""
-    print("🔄 Перезапуск ADB сервера...")
-    subprocess.run(
-        [str(ADB_PATH), "kill-server"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-    time.sleep(5)
-    subprocess.run(
-        [str(ADB_PATH), "start-server"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-    time.sleep(5)
-    print("✅ ADB сервер запущен")
+def log(message: str, level: str = "info") -> None:
+    """Удобный логгер с меткой времени"""
+    ts = datetime.now().strftime("%H:%M:%S")
+    getattr(logger, level)(f"[{ts}] {message}")
 
 
-def connect_to_all_devices(devices: list[str]) -> None:
-    """Подключается ко всем устройствам по списку"""
-    print("\n--- 🔗 Подключение к устройствам ---")
-    connected = 0
+# ==================== SQLITE HELPERS ====================
+def sanitize_table_name(name: str) -> str:
+    """Превращает IP:PORT в валидное имя таблицы SQLite"""
+    # Разрешённые символы: a-z, A-Z, 0-9, _
+    sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+    # Начинается с буквы или подчёркивания
+    if sanitized and sanitized[0].isdigit():
+        sanitized = '_' + sanitized
+    return sanitized[:64]  # лимит SQLite
+
+
+def init_database(devices: list[str]) -> sqlite3.Connection:
+    """Создаёт БД и таблицы для каждого устройства"""
+    log(f"🗄️ Инициализация базы данных: {DB_FILE.name}")
+
+    conn = sqlite3.connect(DB_FILE, timeout=10.0)
+    conn.execute("PRAGMA journal_mode=WAL")  # Параллельные записи
+    conn.execute("PRAGMA synchronous=NORMAL")  # Баланс скорости/надёжности
+    conn.execute("PRAGMA cache_size=-64000")  # 64MB кэш
+    conn.commit()
+
+    cursor = conn.cursor()
+
     for device in devices:
-        print(f"  Connecting to {device}...")
-        result = subprocess.run(
-            [str(ADB_PATH), "connect", device],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        if result.returncode == 0 and "connected" in result.stdout.lower():
-            print(f"  ✓ Connected to {device}")
-            connected += 1
-        else:
-            err = result.stderr.strip() or result.stdout.strip()
-            print(f"  ✗ Failed to connect to {device}: {err}")
-    print(f"--- Подключено: {connected}/{len(devices)} ---\n")
+        table = sanitize_table_name(device)
+
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS "{table}" (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                voltage_mv INTEGER,
+                current_ma INTEGER,
+                cpu_temp1 INTEGER,
+                battery_temp1 INTEGER,
+                battery_temp2 INTEGER,
+                status TEXT NOT NULL,
+                test_duration_sec REAL,
+                capacity_mah REAL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Индексы для быстрого поиска
+        cursor.execute(f'CREATE INDEX IF NOT EXISTS "{table}_ts_idx" ON "{table}"(timestamp)')
+        cursor.execute(f'CREATE INDEX IF NOT EXISTS "{table}_status_idx" ON "{table}"(status)')
+
+    conn.commit()
+    log(f"✅ Создано таблиц: {len(devices)}")
+    return conn
+
+
+def calculate_capacity(conn: sqlite3.Connection, table: str, current_ma: int | None,
+                       poll_interval: int) -> float:
+    """Рассчитывает накопленную ёмкость (mAh) на основе истории"""
+    if current_ma is None:
+        return 0.0
+
+    # Получаем последнюю записанную ёмкость
+    cursor = conn.cursor()
+    cursor.execute(f'SELECT capacity_mah FROM "{table}" ORDER BY id DESC LIMIT 1')
+    row = cursor.fetchone()
+    prev_capacity = row[0] if row and row[0] is not None else 0.0
+
+    # ΔQ = |I| × Δt / 3600 (mAh)
+    delta_capacity = abs(current_ma) * poll_interval / 3600
+    return prev_capacity + delta_capacity
+
+
+# ==================== ADB FUNCTIONS ====================
+def ensure_adb_server_running() -> None:
+    """Перезапускает ADB сервер"""
+    log("🔄 Перезапуск ADB сервера...")
+    subprocess.run([str(ADB_PATH), "kill-server"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(5)
+    subprocess.run([str(ADB_PATH), "start-server"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(5)
+    log("✅ ADB сервер запущен")
+
+
+def connect_to_all_devices(devices: list[str]) -> dict[str, bool]:
+    """Подключается к устройствам, возвращает статус"""
+    log("\n--- 🔗 Подключение к устройствам ---")
+    status = {}
+
+    for device in devices:
+        log(f"  Connecting to {device}...")
+        try:
+            result = subprocess.run(
+                [str(ADB_PATH), "connect", device],
+                capture_output=True, text=True, timeout=30
+            )
+            if result.returncode == 0 and "connected" in result.stdout.lower():
+                log(f"  ✓ Connected to {device}")
+                status[device] = True
+            else:
+                err = result.stderr.strip() or result.stdout.strip()
+                log(f"  ✗ Failed to connect to {device}: {err}", "warn")
+                status[device] = False
+        except Exception as e:
+            log(f"  ✗ Error connecting to {device}: {e}", "error")
+            status[device] = False
+
+    log(f"--- Подключено: {sum(status.values())}/{len(devices)} ---\n")
+    return status
 
 
 def load_devices() -> list[str]:
@@ -88,82 +172,53 @@ def load_devices() -> list[str]:
 
 
 def is_device_connected(device: str) -> bool:
-    """Проверяет, доступно ли устройство через ADB"""
+    """Проверяет доступность устройства"""
     try:
         result = subprocess.run(
             [str(ADB_PATH), "-s", device, "shell", "echo", "ok"],
-            capture_output=True,
-            text=True,
-            timeout=ADB_TIMEOUT_SEC
+            capture_output=True, text=True, timeout=ADB_TIMEOUT_SEC
         )
-        if result.returncode != 0:
-            return False
-        return result.stdout.strip() == "ok"
+        return result.returncode == 0 and result.stdout.strip() == "ok"
     except Exception:
         return False
 
 
 def adb_read(device: str, path: str) -> int | None:
-    """Читает числовое значение из системного файла на устройстве"""
+    """Читает число из системного файла на устройстве"""
     try:
         result = subprocess.run(
             [str(ADB_PATH), "-s", device, "shell", "cat", path],
-            capture_output=True,
-            text=True,
-            timeout=ADB_TIMEOUT_SEC
+            capture_output=True, text=True, timeout=ADB_TIMEOUT_SEC
         )
         if result.returncode != 0:
             return None
-        value_str = result.stdout.strip()
-        if not value_str:
-            return None
-        return int(value_str)
+        value = result.stdout.strip()
+        return int(value) if value else None
     except (subprocess.TimeoutExpired, ValueError, Exception):
         return None
 
 
 def poll_device(device: str) -> dict:
-    """Опрашивает устройство и возвращает словарь с метриками"""
+    """Опрашивает устройство и возвращает метрики"""
     if not is_device_connected(device):
         return {
             "device": device,
-            "voltage_mv": None,
-            "current_ma": None,
-            "cpu_temp1": None,
-            "battery_temp1": None,
-            "battery_temp2": None,
+            "voltage_mv": None, "current_ma": None,
+            "cpu_temp1": None, "battery_temp1": None, "battery_temp2": None,
             "status": "OFFLINE"
         }
 
-    voltage_raw = adb_read(
-        device,
-        "/sys/class/power_supply/battery/voltage_now"
-    )
-    current_raw = adb_read(
-        device,
-        "/sys/class/power_supply/battery/current_now"
-    )
-    cpu_temp1 = adb_read(
-        device,
-        "/sys/class/thermal/thermal_zone5/temp"
-    )
-    battery_temp1 = adb_read(
-        device,
-        "/sys/class/thermal/thermal_zone27/temp"
-    )
-    battery_temp2 = adb_read(
-        device,
-        "/sys/class/thermal/thermal_zone28/temp"
-    )
+    voltage_raw = adb_read(device, "/sys/class/power_supply/battery/voltage_now")
+    current_raw = adb_read(device, "/sys/class/power_supply/battery/current_now")
+    cpu_temp1 = adb_read(device, "/sys/class/thermal/thermal_zone5/temp")
+    battery_temp1 = adb_read(device, "/sys/class/thermal/thermal_zone27/temp")
+    battery_temp2 = adb_read(device, "/sys/class/thermal/thermal_zone28/temp")
 
     if voltage_raw is None or current_raw is None:
         return {
             "device": device,
-            "voltage_mv": None,
-            "current_ma": None,
-            "cpu_temp1": None,
-            "battery_temp1": None,
-            "battery_temp2": None,
+            "voltage_mv": None, "current_ma": None,
+            "cpu_temp1": None, "battery_temp1": None, "battery_temp2": None,
             "status": "NO_DATA"
         }
 
@@ -178,305 +233,328 @@ def poll_device(device: str) -> dict:
     }
 
 
-def _backup_to_csv(device: str, row_data: list) -> None:
-    """Экстренное сохранение строки в CSV при сбое Excel"""
-    try:
-        with open(CSV_BACKUP_FILE, "a", encoding="utf-8-sig") as f:
-            f.write(",".join(str(v) for v in row_data) + "\n")
-    except Exception as e:
-        print(f"[CRITICAL] CSV backup failed for {device}: {e}")
+# ==================== DATABASE WRITER ====================
+class DatabaseWriter:
+    """Потокобезопасный писатель в SQLite с буферизацией"""
 
+    def __init__(self, db_path: Path, devices: list[str], poll_interval: int):
+        self.db_path = db_path
+        self.poll_interval = poll_interval
+        self.queue: Queue = Queue(maxsize=DB_QUEUE_MAXSIZE)
+        self.lock = threading.Lock()
+        self.shutdown_flag = False
+        self.last_commit_time = time.time()
+        self.pending_writes = 0
+        self.capacity_cache = {}  # {table: last_capacity}
 
-def _write_row_to_excel(
-        device: str,
-        row_data: list,
-        timestamp: datetime
-) -> bool:
-    """Внутренняя функция записи одной строки в Excel (вызывается внутри lock)"""
-    global CAPACITY_PER_DEVICE
+        # Инициализируем кэш ёмкости
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        for device in devices:
+            table = sanitize_table_name(device)
+            self.capacity_cache[table] = 0.0
+        conn.close()
 
-    try:
-        wb = openpyxl.load_workbook(EXCEL_FILE)
-        sheet_name = device.replace(":", "_")
+    def start(self) -> threading.Thread:
+        """Запускает фоновый поток записи"""
+        thread = threading.Thread(target=self._worker, daemon=True, name="DBWriter")
+        thread.start()
+        log("📝 Database writer thread started")
+        return thread
 
-        if sheet_name not in wb.sheetnames:
-            print(f"[WARN] Sheet {sheet_name} not found, skipping write")
+    def enqueue(self, device: str, data: dict, test_start: datetime) -> bool:
+        """Добавляет запись в очередь (не блокирует основной поток)"""
+        if self.queue.full():
+            log(f"⚠️ Queue full, dropping data for {device}", "warn")
             return False
 
-        ws = wb[sheet_name]
-
-        # Добавляем Test Duration
-        test_duration = int((timestamp - TEST_START_TIME).total_seconds())
-        row_data.append(test_duration)
-
-        # Рассчитываем Capacity (mAh)
-        current_ma = row_data[3]
-        if current_ma is not None:
-            delta_capacity = abs(current_ma) * POLL_INTERVAL_SEC / 3600
-            CAPACITY_PER_DEVICE[device] = (
-                    CAPACITY_PER_DEVICE.get(device, 0.0) + delta_capacity
-            )
-        row_data.append(round(CAPACITY_PER_DEVICE.get(device, 0.0), 4))
-
-        # Добавляем строку
-        ws.append(row_data)
-
-        # Автоширина колонок (только первые 100 строк)
-        if ws.max_row <= 101:
-            for col in ws.columns:
-                max_length = 0
-                col_letter = col[0].column_letter
-                for cell in col:
-                    try:
-                        if cell.value and len(str(cell.value)) > max_length:
-                            max_length = len(str(cell.value))
-                    except Exception:
-                        pass
-                ws.column_dimensions[col_letter].width = min(
-                    max_length + 2,
-                    50
-                )
-
-        # Цветовая индикация статуса
-        status = row_data[7]
-        fill_color = None
-        if status == "OK":
-            fill_color = PatternFill(
-                start_color="D5F5E3",
-                end_color="D5F5E3",
-                fill_type="solid"
-            )
-        elif status == "OFFLINE":
-            fill_color = PatternFill(
-                start_color="FADBD8",
-                end_color="FADBD8",
-                fill_type="solid"
-            )
-        elif status == "NO_DATA":
-            fill_color = PatternFill(
-                start_color="FEF9E7",
-                end_color="FEF9E7",
-                fill_type="solid"
-            )
-
-        if fill_color:
-            for col_num in range(1, len(row_data) + 1):
-                cell = ws.cell(row=ws.max_row, column=col_num)
-                cell.fill = fill_color
-
-        wb.save(EXCEL_FILE)
+        entry = {
+            "device": device,
+            "table": sanitize_table_name(device),
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "data": data,
+            "test_start": test_start
+        }
+        self.queue.put(entry, block=False)
         return True
 
-    except Exception as e:
-        print(f"[ERROR] Excel write failed for {device}: {e}")
-        return False
+    def _worker(self) -> None:
+        """Фоновый поток: забирает из очереди и пишет в БД"""
+        conn = None
+
+        while not self.shutdown_flag or not self.queue.empty():
+            try:
+                # Получаем запись с таймаутом
+                entry = self.queue.get(timeout=1.0)
+            except QueueEmpty:
+                # Проверяем, не пора ли закоммитить буфер
+                if self.pending_writes > 0:
+                    self._commit_if_needed(conn)
+                continue
+
+            try:
+                if conn is None:
+                    conn = self._get_connection()
+
+                self._write_entry(conn, entry)
+                self.pending_writes += 1
+                self._commit_if_needed(conn)
+
+            except Exception as e:
+                log(f"[ERROR] Write failed for {entry['device']}: {e}", "error")
+                # Пробуем переподключиться к БД
+                if conn:
+                    try:
+                        conn.close()
+                    except:
+                        pass
+                conn = None
+            finally:
+                self.queue.task_done()
+
+        # Финальный коммит
+        if conn and self.pending_writes > 0:
+            try:
+                conn.commit()
+                log("✅ Final commit done")
+            except Exception as e:
+                log(f"[ERROR] Final commit failed: {e}", "error")
+
+        if conn:
+            conn.close()
+        log("📝 Database writer thread stopped")
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """Создаёт новое подключение к БД"""
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _write_entry(self, conn: sqlite3.Connection, entry: dict) -> None:
+        """Записывает одну запись в таблицу"""
+        table = entry["table"]
+        data = entry["data"]
+        test_start = entry["test_start"]
+        timestamp = entry["timestamp"]
+
+        # Расчёт тестовой длительности
+        now = datetime.now()
+        duration = (now - test_start).total_seconds()
+
+        # Расчёт ёмкости
+        current_ma = data.get("current_ma")
+        if current_ma is not None:
+            delta = abs(current_ma) * self.poll_interval / 3600
+            self.capacity_cache[table] = self.capacity_cache.get(table, 0.0) + delta
+        capacity = round(self.capacity_cache.get(table, 0.0), 4)
+
+        # Параметризованный запрос (защита от SQL-инъекций + кэширование плана)
+        conn.execute(f"""
+            INSERT INTO "{table}" 
+            (timestamp, voltage_mv, current_ma, cpu_temp1, battery_temp1, 
+             battery_temp2, status, test_duration_sec, capacity_mah)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            timestamp,
+            data.get("voltage_mv"),
+            data.get("current_ma"),
+            data.get("cpu_temp1"),
+            data.get("battery_temp1"),
+            data.get("battery_temp2"),
+            data.get("status"),
+            duration,
+            capacity
+        ))
+
+    def _commit_if_needed(self, conn: sqlite3.Connection) -> None:
+        """Коммитит если прошло достаточно времени или накопилось много записей"""
+        now = time.time()
+        if (now - self.last_commit_time) >= DB_COMMIT_INTERVAL_SEC or self.pending_writes >= 100:
+            try:
+                conn.commit()
+                self.last_commit_time = now
+                self.pending_writes = 0
+            except Exception as e:
+                log(f"[ERROR] Commit failed: {e}", "error")
+
+    def shutdown(self) -> None:
+        """Сигнал остановки"""
+        self.shutdown_flag = True
 
 
-def _excel_writer_worker() -> None:
-    """Фоновый поток для безопасной записи в Excel"""
-    global _shutdown_flag
+# ==================== EXPORT FUNCTIONS ====================
+def export_device_to_csv(db_path: Path, device: str, output_path: Path = None) -> Path:
+    """Экспортирует данные устройства в CSV"""
+    table = sanitize_table_name(device)
+    if output_path is None:
+        output_path = db_path.parent / f"{device.replace(':', '_')}.csv"
 
-    print("📝 Writer thread started")
+    conn = sqlite3.connect(db_path, timeout=5.0)
+    cursor = conn.cursor()
 
-    while not _shutdown_flag or not _write_queue.empty():
-        try:
-            device, row_data, timestamp = _write_queue.get(timeout=1.0)
+    try:
+        cursor.execute(f'SELECT * FROM "{table}" ORDER BY timestamp')
+        columns = [desc[0] for desc in cursor.description]
 
-            with _excel_write_lock:
-                success = _write_row_to_excel(device, row_data, timestamp)
-                if not success:
-                    _backup_to_csv(device, row_data)
+        with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
+            import csv
+            writer = csv.writer(f)
+            writer.writerow(columns)
+            writer.writerows(cursor.fetchall())
 
-            _write_queue.task_done()
+        log(f"✅ Экспортировано: {device} → {output_path.name}")
+        return output_path
 
-        except Exception as e:
-            print(f"[ERROR] Writer thread: {e}")
-            time.sleep(0.5)
-
-    print("📝 Writer thread stopped")
-
-
-def append_to_excel_async(device: str, row_data: list) -> None:
-    """Публичный API: добавляет данные в очередь записи (не блокирует)"""
-    _write_queue.put((device, row_data.copy(), datetime.now()))
+    finally:
+        conn.close()
 
 
-def init_excel(devices: list[str]) -> None:
-    """Инициализирует Excel файл с листами для каждого устройства"""
-    global TEST_START_TIME, CAPACITY_PER_DEVICE
+def export_all_to_csv(db_path: Path, output_dir: Path = None) -> list[Path]:
+    """Экспортирует все таблицы в отдельные CSV-файлы"""
+    if output_dir is None:
+        output_dir = db_path.parent / "csv_export"
+    output_dir.mkdir(exist_ok=True)
 
-    TEST_START_TIME = datetime.now()
+    conn = sqlite3.connect(db_path, timeout=5.0)
+    cursor = conn.cursor()
 
-    for device in devices:
-        CAPACITY_PER_DEVICE[device] = 0.0
+    # Получаем список таблиц
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+    tables = [row[0] for row in cursor.fetchall()]
 
-    # Проверяем шаблон
-    template = BASE_DIR / "battery_log_template.xlsx"
-    if template.exists():
-        shutil.copy(template, EXCEL_FILE)
-        print(f"📋 Использован шаблон: {template.name}")
-        return
+    exported = []
+    for table in tables:
+        output_path = output_dir / f"{table}.csv"
+        export_device_to_csv(db_path, table.replace('_', ':'), output_path)
+        exported.append(output_path)
 
-    # Создаём новый файл
-    wb = openpyxl.Workbook()
-    default_sheet = wb.active
-    wb.remove(default_sheet)
-
-    headers = [
-        "Timestamp",
-        "Device",
-        "Voltage (mV)",
-        "Current (mA)",
-        "CPU temp(cpu_big1)",
-        "Battery Temp #1",
-        "Battery Temp #2",
-        "Status",
-        "Test Duration (sec)",
-        "Capacity (mAh)"
-    ]
-
-    for device in devices:
-        safe_name = device.replace(":", "_").replace("/", "_").replace("\\", "_")
-        safe_name = safe_name[:31]
-
-        ws = wb.create_sheet(title=safe_name)
-
-        for col_num, header in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=col_num, value=header)
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill(
-                start_color="4472C4",
-                end_color="4472C4",
-                fill_type="solid"
-            )
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            ws.column_dimensions[get_column_letter(col_num)].width = (
-                    len(header) + 2
-            )
-
-    wb.save(EXCEL_FILE)
-    print(f"✅ Excel файл создан: {EXCEL_FILE.name}")
+    conn.close()
+    log(f"✅ Экспортировано таблиц: {len(exported)} в {output_dir}")
+    return exported
 
 
-def _graceful_shutdown(signum=None, frame=None) -> None:
+# ==================== MAIN ====================
+def _graceful_shutdown(db_writer: DatabaseWriter, *args) -> None:
     """Обработчик корректного завершения"""
-    global _shutdown_flag
+    log("\n⏹ Получен сигнал остановки...")
+    db_writer.shutdown()
 
-    print("\n⏹ Получен сигнал остановки...")
-    _shutdown_flag = True
+    log("⏳ Ожидание завершения записи...")
+    db_writer.queue.join()
+    time.sleep(1)  # даём время на финальный коммит
 
-    print("⏳ Ожидание завершения записи данных...")
-    _write_queue.join()
-
-    if _writer_thread and _writer_thread.is_alive():
-        _writer_thread.join(timeout=5.0)
-
-    print("✅ Все данные сохранены. Можно закрывать программу.")
+    log("✅ Все данные сохранены в базу")
 
 
 def main() -> None:
-    global MAX_WORKERS, _writer_thread
-
-    print(f"🔋 Battery Monitor v1.2")
-    print(f"📁 Working directory: {BASE_DIR}")
-    print(f"🔧 ADB path: {ADB_PATH} (exists: {ADB_PATH.exists()})\n")
+    log(f"🔋 Battery Monitor v2.0 (SQLite)")
+    log(f"📁 Directory: {BASE_DIR}")
+    log(f"🗄️ Database: {DB_FILE.name}")
+    log(f"🔧 ADB: {ADB_PATH} (exists: {ADB_PATH.exists()})")
 
     if not ADB_PATH.exists():
-        print(f"❌ ADB не найден: {ADB_PATH}")
-        print(
-            "💡 Скачайте platform-tools: "
-            "https://developer.android.com/tools/releases/platform-tools"
-        )
+        log(f"❌ ADB not found: {ADB_PATH}", "error")
         return
 
+    # Инициализация
     ensure_adb_server_running()
 
     try:
         devices = load_devices()
     except FileNotFoundError as e:
-        print(f"❌ {e}")
+        log(f"❌ {e}", "error")
         return
 
     if not devices:
-        print("❌ Список устройств пуст")
+        log("❌ No devices listed", "error")
         return
 
-    MAX_WORKERS = min(12, len(devices))
-    print(f"🔧 Workers: {MAX_WORKERS} (устройств: {len(devices)})")
+    # Подключение к устройствам
+    connection_status = connect_to_all_devices(devices)
+    active_devices = [d for d in devices if connection_status.get(d)]
 
-    connect_to_all_devices(devices)
+    if not active_devices:
+        log("❌ No devices connected", "error")
+        return
 
-    init_excel(devices)
+    # Инициализация БД и писателя
+    init_database(active_devices)
+    db_writer = DatabaseWriter(DB_FILE, active_devices, POLL_INTERVAL_SEC)
+    writer_thread = db_writer.start()
 
-    _writer_thread = threading.Thread(
-        target=_excel_writer_worker,
-        daemon=True
-    )
-    _writer_thread.start()
+    # Обработчики сигналов
+    signal.signal(signal.SIGINT, lambda s, f: _graceful_shutdown(db_writer))
+    signal.signal(signal.SIGTERM, lambda s, f: _graceful_shutdown(db_writer))
 
-    signal.signal(signal.SIGINT, _graceful_shutdown)
-    signal.signal(signal.SIGTERM, _graceful_shutdown)
-
-    print(f"\n🚀 Старт мониторинга ({len(devices)} устройств, интервал {POLL_INTERVAL_SEC}с)")
-    print("💡 Нажмите Ctrl+C для корректной остановки\n")
+    # Старт мониторинга
+    test_start = datetime.now()
+    log(f"\n🚀 Start: {len(active_devices)} devices, {POLL_INTERVAL_SEC}s interval")
+    log("💡 Press Ctrl+C to stop gracefully\n")
 
     iteration = 0
-    start_time = datetime.now()
+    start_time = time.time()
 
     try:
-        while not _shutdown_flag:
+        while True:
             iteration += 1
             timestamp = datetime.now().isoformat(timespec="seconds")
 
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                futures = {
-                    executor.submit(poll_device, d): d
-                    for d in devices
-                }
-
-                for future in as_completed(futures):
-                    device = futures[future]
-                    try:
-                        result = future.result(timeout=ADB_TIMEOUT_SEC)
-
-                        row = [
-                            timestamp,
-                            result["device"],
-                            result["voltage_mv"],
-                            result["current_ma"],
-                            result["cpu_temp1"],
-                            result["battery_temp1"],
-                            result["battery_temp2"],
-                            result["status"],
-                        ]
-
-                        print(
-                            f"[{result['device']}] "
-                            f"{result['status']:8s} "
-                            f"V={result['voltage_mv']:5d}mV "
-                            f"I={result['current_ma']:6d}mA "
-                            f"CPU={result['cpu_temp1']:3d}°C "
-                            f"BAT1={result['battery_temp1']:3d}°C "
-                            f"BAT2={result['battery_temp2']:3d}°C"
+            # Периодический переподключ для стабильности
+            if iteration % 120 == 0:  # каждые 10 минут
+                log("🔄 Checking connections...")
+                for device in active_devices:
+                    if not is_device_connected(device):
+                        log(f"  🔌 Reconnecting {device}...")
+                        subprocess.run(
+                            [str(ADB_PATH), "connect", device],
+                            capture_output=True, timeout=10
                         )
 
-                        append_to_excel_async(result["device"], row)
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {executor.submit(poll_device, d): d for d in active_devices}
 
+                for future in as_completed(futures, timeout=ADB_TIMEOUT_SEC + 5):
+                    device = futures[future]
+                    try:
+                        result = future.result(timeout=5)
+
+                        # Лог только при изменении статуса или раз в минуту
+                        if result["status"] != "OK" or iteration % 12 == 0:
+                            log(
+                                f"[{device}] {result['status']:8s} "
+                                f"V={result['voltage_mv']}mV I={result['current_ma']}mA "
+                                f"CPU={result['cpu_temp1']}°C BAT={result['battery_temp1']}°C"
+                            )
+
+                        # Асинхронная запись в БД
+                        db_writer.enqueue(device, result, test_start)
+
+                    except FutureTimeoutError:
+                        log(f"[WARN] Polling timeout for {device}", "warn")
                     except Exception as e:
-                        print(f"[ERROR] Polling {device}: {e}")
+                        log(f"[ERROR] Polling {device}: {type(e).__name__}: {e}", "error")
 
+            # Прогресс раз в минуту
             if iteration % 12 == 0:
-                elapsed = (datetime.now() - start_time).total_seconds() / 60
-                print(f"⏱ Прогресс: {elapsed:.1f} мин | Итерация: {iteration}")
+                elapsed = (time.time() - start_time) / 60
+                queue_size = db_writer.queue.qsize()
+                log(f"⏱ {elapsed:.1f}min | iter:{iteration} | queue:{queue_size}")
 
             time.sleep(POLL_INTERVAL_SEC)
 
+    except KeyboardInterrupt:
+        pass  # обработается в finally
     except Exception as e:
-        print(f"[FATAL] Unexpected error: {e}")
+        log(f"[FATAL] {type(e).__name__}: {e}", "error")
         import traceback
-        traceback.print_exc()
+        logger.exception("Stack trace")
     finally:
-        _graceful_shutdown()
+        _graceful_shutdown(db_writer)
+
+        # Подсказка про экспорт
+        log(f"\n💡 Данные сохранены в: {DB_FILE}")
+        log("💡 Для экспорта в CSV запустите:")
+        log(f"   python -c \"from battery_monitor_sqlite import export_all_to_csv; export_all_to_csv('{DB_FILE}')\"")
 
 
 if __name__ == "__main__":
