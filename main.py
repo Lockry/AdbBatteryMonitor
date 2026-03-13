@@ -511,14 +511,20 @@ def main() -> None:
                         )
 
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                # Создаем задачи для всех устройств
                 futures = {executor.submit(poll_device, d): d for d in active_devices}
 
                 for future in as_completed(futures, timeout=ADB_TIMEOUT_SEC + 5):
                     device = futures[future]
                     try:
-                        result = future.result(timeout=5)
+                        # Получаем результат с индивидуальным таймаутом
+                        result = future.result(timeout=10)
 
-                        # Лог только при изменении статуса или раз в минуту
+                        # Если устройство оффлайн — всё равно пишем в БД, чтобы был лог простоя
+                        if result["status"] == "OFFLINE":
+                            log(f"[{device}] 🔴 OFFLINE (ждем восстановления...)", "warn")
+
+                        # Логирование (реже, чтобы не спамить)
                         if result["status"] != "OK" or iteration % 12 == 0:
                             log(
                                 f"[{device}] {result['status']:8s} "
@@ -526,13 +532,27 @@ def main() -> None:
                                 f"CPU={result['cpu_temp1']}°C BAT={result['battery_temp1']}°C"
                             )
 
-                        # Асинхронная запись в БД
+                        # Запись в БД (даже если статус OFFLINE)
                         db_writer.enqueue(device, result, test_start)
 
                     except FutureTimeoutError:
-                        log(f"[WARN] Polling timeout for {device}", "warn")
+                        # Устройство не ответило — записываем таймаут и идем дальше
+                        log(f"[{device}] ⏱ Timeout polling, пропускаем итерацию", "warn")
+                        db_writer.enqueue(device, {
+                            "device": device, "status": "TIMEOUT",
+                            "voltage_mv": None, "current_ma": None,
+                            "cpu_temp1": None, "battery_temp1": None, "battery_temp2": None
+                        }, test_start)
+
                     except Exception as e:
-                        log(f"[ERROR] Polling {device}: {type(e).__name__}: {e}", "error")
+                        # Любая другая ошибка не должна ронять весь скрипт!
+                        log(f"[{device}] ❌ Error: {type(e).__name__}: {e}", "error")
+                        # Пробуем спасти запись
+                        db_writer.enqueue(device, {
+                            "device": device, "status": "ERROR",
+                            "voltage_mv": None, "current_ma": None,
+                            "cpu_temp1": None, "battery_temp1": None, "battery_temp2": None
+                        }, test_start)
 
             # Прогресс раз в минуту
             if iteration % 12 == 0:
