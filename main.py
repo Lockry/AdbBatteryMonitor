@@ -499,17 +499,6 @@ def main() -> None:
             iteration += 1
             timestamp = datetime.now().isoformat(timespec="seconds")
 
-            # Периодический переподключ для стабильности
-            if iteration % 120 == 0:  # каждые 10 минут
-                log("🔄 Checking connections...")
-                for device in active_devices:
-                    if not is_device_connected(device):
-                        log(f"  🔌 Reconnecting {device}...")
-                        subprocess.run(
-                            [str(ADB_PATH), "connect", device],
-                            capture_output=True, timeout=10
-                        )
-
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 # Создаем задачи для всех устройств
                 futures = {executor.submit(poll_device, d): d for d in active_devices}
