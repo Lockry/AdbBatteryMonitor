@@ -511,7 +511,7 @@ def main() -> None:
 
                         # Если устройство оффлайн — всё равно пишем в БД, чтобы был лог простоя
                         if result["status"] == "OFFLINE":
-                            log(f"[{device}] 🔴 OFFLINE (ждем восстановления...)", "warn")
+                            log(f"[{device}] 🔴 OFFLINE", "warn")
 
                         # Логирование (реже, чтобы не спамить)
                         if result["status"] != "OK" or iteration % 12 == 0:
