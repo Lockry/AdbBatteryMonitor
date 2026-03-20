@@ -477,6 +477,14 @@ def main() -> None:
         log("❌ No devices connected", "error")
         return
 
+    if DB_FILE.exists():
+        log(f"🗑️ Удаляем старую БД: {DB_FILE.name}")
+        try:
+            DB_FILE.unlink()
+        except Exception as e:
+            log(f"❌ Не удалось удалить БД: {e}", "error")
+            return
+
     # Инициализация БД и писателя
     init_database(active_devices)
     db_writer = DatabaseWriter(DB_FILE, active_devices, POLL_INTERVAL_SEC)
