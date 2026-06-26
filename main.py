@@ -73,6 +73,7 @@ def init_database(devices: list[str]) -> None:
             CREATE TABLE IF NOT EXISTS "{table}" (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
+                capacity_pct INTEGER,  
                 voltage_mv INTEGER,
                 current_ma INTEGER,
                 cpu_temp1 INTEGER,
@@ -179,11 +180,12 @@ def poll_device(device: str) -> dict:
     if not is_device_connected(device):
         return {
             "device": device,
+            "capacity_pct": None,
             "voltage_mv": None, "current_ma": None,
             "cpu_temp1": None, "battery_temp1": None, "battery_temp2": None,
             "status": "OFFLINE"
         }
-
+    capacity_pct = adb_read(device, "/sys/class/power_supply/battery/capacity")
     voltage_raw = adb_read(device, "/sys/class/power_supply/battery/voltage_now")
     current_raw = adb_read(device, "/sys/class/power_supply/battery/current_now")
     cpu_temp1 = adb_read(device, "/sys/class/thermal/thermal_zone5/temp")
@@ -193,6 +195,7 @@ def poll_device(device: str) -> dict:
     if voltage_raw is None or current_raw is None:
         return {
             "device": device,
+            "capacity_pct": None,
             "voltage_mv": None, "current_ma": None,
             "cpu_temp1": None, "battery_temp1": None, "battery_temp2": None,
             "status": "NO_DATA"
@@ -200,6 +203,7 @@ def poll_device(device: str) -> dict:
 
     return {
         "device": device,
+        "capacity_pct": capacity_pct,
         "voltage_mv": voltage_raw // 1000,
         "current_ma": current_raw // 1000,
         "cpu_temp1": cpu_temp1 // 1000 if cpu_temp1 else None,
@@ -230,7 +234,8 @@ def collect_results(futures: dict[Future, str], db_writer: "DatabaseWriter",
                 log(
                     f"[{device}] {status_label:12s} "
                     f"V={result['voltage_mv']}mV I={result['current_ma']}mA "
-                    f"CPU={result['cpu_temp1']}°C BAT={result['battery_temp1']}°C"
+                    f"CPU={result['cpu_temp1']}°C BAT={result['battery_temp1']}°C "
+                    f"SOC={result['capacity_pct']}%"
                 )
 
             db_writer.enqueue(device, result, test_start)
@@ -239,7 +244,7 @@ def collect_results(futures: dict[Future, str], db_writer: "DatabaseWriter",
             # future.result() тоже может кинуть TimeoutError — перехватываем здесь
             log(f"[{device}] ⏱ Future timeout, пропускаем итерацию", "warning")
             db_writer.enqueue(device, {
-                "device": device, "status": "TIMEOUT",
+                "device": device, "status": "TIMEOUT",  "capacity_pct": None,
                 "voltage_mv": None, "current_ma": None,
                 "cpu_temp1": None, "battery_temp1": None, "battery_temp2": None
             }, test_start)
@@ -247,7 +252,7 @@ def collect_results(futures: dict[Future, str], db_writer: "DatabaseWriter",
         except Exception as e:
             log(f"[{device}] ❌ Error: {type(e).__name__}: {e}", "error")
             db_writer.enqueue(device, {
-                "device": device, "status": "ERROR",
+                "device": device, "status": "ERROR",  "capacity_pct": None,
                 "voltage_mv": None, "current_ma": None,
                 "cpu_temp1": None, "battery_temp1": None, "battery_temp2": None
             }, test_start)
@@ -357,11 +362,12 @@ class DatabaseWriter:
 
         conn.execute(f"""
             INSERT INTO "{table}"
-            (timestamp, voltage_mv, current_ma, cpu_temp1, battery_temp1,
+            (timestamp, capacity_pct, voltage_mv, current_ma, cpu_temp1, battery_temp1,
              battery_temp2, status, test_duration_sec, capacity_mah)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             timestamp,
+            data.get("capacity_pct"),
             data.get("voltage_mv"),
             data.get("current_ma"),
             data.get("cpu_temp1"),
@@ -532,7 +538,7 @@ def main() -> None:
 
         log(f"\n💡 Данные сохранены в: {DB_FILE}")
         log("💡 Для экспорта в CSV запустите:")
-        log(f'   python -c "from main import export_all_to_csv; export_all_to_csv(\'{ DB_FILE }\')"')
+        log(f'   python -c "from main import export_all_to_csv; export_all_to_csv(\'{DB_FILE}\')"')
 
 
 if __name__ == "__main__":
