@@ -17,8 +17,8 @@ from openpyxl.utils import get_column_letter
 from openpyxl.chart import LineChart, Reference
 
 # ==================== CONFIG ====================
-DEFAULT_DB = Path("battery_log.db")
-DEFAULT_OUTPUT = Path("battery_report.xlsx")
+DEFAULT_DB = Path("battery_log_08_05_offfff.db")
+DEFAULT_OUTPUT = Path("battery_report_off.xlsx")
 
 # Лимиты для безопасности
 MAX_ROWS_EXPORT = 100000  # не экспортировать больше этого на лист
