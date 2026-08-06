@@ -13,8 +13,8 @@ from queue import Queue, Empty as QueueEmpty
 # ==================== CONFIG ====================
 BASE_DIR = Path(__file__).resolve().parent
 DEVICES_FILE = BASE_DIR / "devices.txt"
-DB_FILE = BASE_DIR / "battery_log.db"
 LOG_FILE = BASE_DIR / "battery_monitor.log"
+APP_PACKAGE = "com.lockry.loadbattery"
 
 POLL_INTERVAL_SEC = 5
 ADB_TIMEOUT_SEC = 5
@@ -23,6 +23,39 @@ DB_COMMIT_INTERVAL_SEC = 5
 DB_QUEUE_MAXSIZE = 3000
 
 ADB_PATH = BASE_DIR / "platform-tools" / "adb.exe"
+
+def launch_app(device: str, package: str) -> bool:
+    """Запускает приложение на устройстве через monkey (не требует знания Activity)"""
+    try:
+        result = subprocess.run(
+            [str(ADB_PATH), "-s", device, "shell", "monkey",
+             "-p", package, "-c", "android.intent.category.LAUNCHER", "1"],
+            capture_output=True, text=True, timeout=15
+        )
+        output = (result.stdout + result.stderr).strip()
+        if result.returncode == 0 and "Events injected: 1" in output:
+            log(f"  ▶️ [{device}] Приложение запущено: {package}")
+            return True
+        else:
+            log(f"  ⚠️ [{device}] Не удалось запустить {package}: {output}", "warning")
+            return False
+    except Exception as e:
+        log(f"  ⚠️ [{device}] Ошибка запуска {package}: {e}", "warning")
+        return False
+
+
+def launch_app_on_all_devices(devices: list[str], package: str) -> None:
+    """Запускает приложение на всех активных устройствах"""
+    log(f"\n--- 📲 Запуск {package} на устройствах ---")
+    for device in devices:
+        launch_app(device, package)
+    log("")
+
+def generate_db_filename() -> Path:
+    ts = datetime.now().strftime("%d%m_%H%M")
+    return BASE_DIR / f"battery_log_{ts}.db"
+
+DB_FILE = generate_db_filename()
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -161,7 +194,6 @@ def is_device_connected(device: str) -> bool:
 
 
 def adb_read(device: str, path: str) -> int | None:
-    """Читает число из системного файла на устройстве"""
     try:
         result = subprocess.run(
             [str(ADB_PATH), "-s", device, "shell", "cat", path],
@@ -215,20 +247,12 @@ def poll_device(device: str) -> dict:
 
 def collect_results(futures: dict[Future, str], db_writer: "DatabaseWriter",
                     test_start: datetime, iteration: int) -> None:
-    """
-    Собирает результаты futures без бросания TimeoutError наружу.
-
-    Вместо as_completed(..., timeout=X) — который падает если хоть один future
-    завис — используем явный поллинг с индивидуальным таймаутом на каждый future.
-    Зависший future логируется как TIMEOUT и не роняет всю программу.
-    """
     FUTURE_TIMEOUT = ADB_TIMEOUT_SEC + 5  # секунд на один future
 
     for future, device in futures.items():
         try:
             result = future.result(timeout=FUTURE_TIMEOUT)
 
-            # Лог только для не-OK или раз в минуту
             if result["status"] != "OK" or iteration % 12 == 0:
                 status_label = "🔴 OFFLINE" if result["status"] == "OFFLINE" else result["status"]
                 log(
@@ -241,7 +265,6 @@ def collect_results(futures: dict[Future, str], db_writer: "DatabaseWriter",
             db_writer.enqueue(device, result, test_start)
 
         except TimeoutError:
-            # future.result() тоже может кинуть TimeoutError — перехватываем здесь
             log(f"[{device}] ⏱ Future timeout, пропускаем итерацию", "warning")
             db_writer.enqueue(device, {
                 "device": device, "status": "TIMEOUT",  "capacity_pct": None,
@@ -454,6 +477,9 @@ def _graceful_shutdown(db_writer: DatabaseWriter) -> None:
 
 
 def main() -> None:
+    global DB_FILE
+    DB_FILE = generate_db_filename()
+
     log(f"🔋 Battery Monitor v2.1 (SQLite)")
     log(f"📁 Directory: {BASE_DIR}")
     log(f"🗄️ Database: {DB_FILE.name}")
@@ -477,6 +503,8 @@ def main() -> None:
 
     connection_status = connect_to_all_devices(devices)
     active_devices = [d for d in devices if connection_status.get(d)]
+
+    launch_app_on_all_devices(active_devices, APP_PACKAGE)
 
     if not active_devices:
         log("❌ No devices connected", "error")
@@ -513,21 +541,15 @@ def main() -> None:
     try:
         while not shutdown_requested.is_set():
             iteration += 1
-
-            # ThreadPoolExecutor пересоздаём каждую итерацию — зависшие воркеры
-            # не накапливаются, каждый future живёт не дольше одного цикла
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 futures = {executor.submit(poll_device, d): d for d in active_devices}
                 collect_results(futures, db_writer, test_start, iteration)
-                # executor.__exit__ отменяет незавершённые futures и ждёт воркеров,
-                # но не блокирует дольше естественного завершения потоков
 
             if iteration % 12 == 0:
                 elapsed = (time.time() - start_time) / 60
                 queue_size = db_writer.queue.qsize()
                 log(f"⏱ {elapsed:.1f}min | iter:{iteration} | queue:{queue_size}")
 
-            # sleep с возможностью прерваться по сигналу
             shutdown_requested.wait(timeout=POLL_INTERVAL_SEC)
 
     except Exception as e:

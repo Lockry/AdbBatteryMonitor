@@ -17,8 +17,8 @@ from queue import Queue, Empty as QueueEmpty
 # ==================== CONFIG ====================
 BASE_DIR = Path(__file__).resolve().parent
 DEVICES_FILE = BASE_DIR / "devices.txt"
+LOG_FILE = BASE_DIR / "battery_monitorKT1.log"
 APP_PACKAGE = "com.lockry.loadbattery"
-LOG_FILE = BASE_DIR / "battery_monitor.log"
 
 POLL_INTERVAL_SEC = 5
 ADB_TIMEOUT_SEC = 5
@@ -27,20 +27,46 @@ DB_COMMIT_INTERVAL_SEC = 5
 DB_QUEUE_MAXSIZE = 3000
 
 
+# Пути специфичные для этого устройства (bq27510g3-0 fuel gauge)
+BATTERY_NODE = "bq27510g3-0"
+CPU1_THERMAL_ZONE = "thermal_zone10"   # tsens_tz_sensor6
+CPU2_THERMAL_ZONE = "thermal_zone20"   # pm8953_tz
+
+def launch_app(device: str, package: str) -> bool:
+    """Запускает приложение на устройстве через monkey (не требует знания Activity)"""
+    try:
+        result = subprocess.run(
+            [str(ADB_PATH), "-s", device, "shell", "monkey",
+             "-p", package, "-c", "android.intent.category.LAUNCHER", "1"],
+            capture_output=True, text=True, timeout=15
+        )
+        output = (result.stdout + result.stderr).strip()
+        if result.returncode == 0 and "Events injected: 1" in output:
+            log(f"  ▶️ [{device}] Приложение запущено: {package}")
+            return True
+        else:
+            log(f"  ⚠️ [{device}] Не удалось запустить {package}: {output}", "warning")
+            return False
+    except Exception as e:
+        log(f"  ⚠️ [{device}] Ошибка запуска {package}: {e}", "warning")
+        return False
+
+
+def launch_app_on_all_devices(devices: list[str], package: str) -> None:
+    """Запускает приложение на всех активных устройствах"""
+    log(f"\n--- 📲 Запуск {package} на устройствах ---")
+    for device in devices:
+        launch_app(device, package)
+    log("")
+
 def generate_db_filename() -> Path:
     ts = datetime.now().strftime("%d%m_%H%M")
     return BASE_DIR / f"battery_log_{ts}.db"
 
 DB_FILE = generate_db_filename()
 
+
 def resolve_adb_path() -> Path:
-    """
-    Ищет adb в трёх местах (в порядке приоритета):
-      1) ./platform-tools/adb (или adb.exe на Windows) рядом со скриптом
-      2) $ANDROID_HOME/platform-tools/adb или $ANDROID_SDK_ROOT/platform-tools/adb
-      3) adb, найденный в PATH (brew install android-platform-tools,
-         Android Studio, etc.)
-    """
     binary_name = "adb.exe" if platform.system() == "Windows" else "adb"
 
     local_candidate = BASE_DIR / "platform-tools-mac" / binary_name
@@ -58,13 +84,10 @@ def resolve_adb_path() -> Path:
     if which_result:
         return Path(which_result)
 
-    # Ничего не нашли — возвращаем локальный путь как дефолт,
-    # чтобы дальше сработала понятная проверка ADB_PATH.exists()
     return local_candidate
 
 
 def ensure_executable(path: Path) -> None:
-    """На macOS/Linux бинарник adb должен иметь бит на исполнение."""
     if platform.system() == "Windows":
         return
     try:
@@ -73,7 +96,6 @@ def ensure_executable(path: Path) -> None:
             if not (current_mode & stat.S_IXUSR):
                 path.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     except Exception:
-        # Не критично — если прав не хватит, subprocess сам упадёт с понятной ошибкой
         pass
 
 
@@ -93,9 +115,7 @@ logger = logging.getLogger(__name__)
 
 
 def log(message: str, level: str = "info") -> None:
-    """Удобный логгер с меткой времени"""
     ts = datetime.now().strftime("%H:%M:%S")
-    # "warn" — deprecated alias, используем "warning"
     if level == "warn":
         level = "warning"
     getattr(logger, level)(f"[{ts}] {message}")
@@ -103,7 +123,6 @@ def log(message: str, level: str = "info") -> None:
 
 # ==================== SQLITE HELPERS ====================
 def sanitize_table_name(name: str) -> str:
-    """Превращает IP:PORT в валидное имя таблицы SQLite"""
     sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', name)
     if sanitized and sanitized[0].isdigit():
         sanitized = '_' + sanitized
@@ -129,12 +148,12 @@ def init_database(devices: list[str]) -> None:
             CREATE TABLE IF NOT EXISTS "{table}" (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
-                capacity_pct INTEGER,  
+                capacity_pct INTEGER,
                 voltage_mv INTEGER,
                 current_ma INTEGER,
-                cpu_temp1 INTEGER,
-                battery_temp1 INTEGER,
-                battery_temp2 INTEGER,
+                cpu_temp1 REAL,
+                cpu_temp2 REAL,
+                battery_temp REAL,
                 status TEXT NOT NULL,
                 test_duration_sec REAL,
                 capacity_mah REAL,
@@ -151,7 +170,6 @@ def init_database(devices: list[str]) -> None:
 
 # ==================== ADB FUNCTIONS ====================
 def ensure_adb_server_running() -> None:
-    """Перезапускает ADB сервер"""
     log("🔄 Перезапуск ADB сервера...")
     subprocess.run([str(ADB_PATH), "kill-server"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -163,7 +181,6 @@ def ensure_adb_server_running() -> None:
 
 
 def connect_to_all_devices(devices: list[str]) -> dict[str, bool]:
-    """Подключается к устройствам, возвращает статус"""
     log("\n--- 🔗 Подключение к устройствам ---")
     status = {}
 
@@ -190,7 +207,6 @@ def connect_to_all_devices(devices: list[str]) -> dict[str, bool]:
 
 
 def load_devices() -> list[str]:
-    """Загружает список устройств из файла"""
     if not DEVICES_FILE.exists():
         raise FileNotFoundError(f"Файл {DEVICES_FILE} не найден")
 
@@ -205,7 +221,6 @@ def load_devices() -> list[str]:
 
 
 def is_device_connected(device: str) -> bool:
-    """Проверяет доступность устройства"""
     try:
         result = subprocess.run(
             [str(ADB_PATH), "-s", device, "shell", "echo", "ok"],
@@ -233,85 +248,80 @@ def adb_read(device: str, path: str) -> int | None:
 
 def poll_device(device: str) -> dict:
     """Опрашивает устройство и возвращает метрики"""
+    empty_result = {
+        "device": device,
+        "capacity_pct": None,
+        "voltage_mv": None, "current_ma": None,
+        "cpu_temp1": None, "cpu_temp2": None, "battery_temp": None,
+        "status": "OFFLINE"
+    }
+
     if not is_device_connected(device):
-        return {
-            "device": device,
-            "capacity_pct": None,
-            "voltage_mv": None, "current_ma": None,
-            "cpu_temp1": None, "battery_temp1": None, "battery_temp2": None,
-            "status": "OFFLINE"
-        }
-    capacity_pct = adb_read(device, "/sys/class/power_supply/battery/capacity")
-    voltage_raw = adb_read(device, "/sys/class/power_supply/battery/voltage_now")
-    current_raw = adb_read(device, "/sys/class/power_supply/battery/current_now")
-    cpu_temp1 = adb_read(device, "/sys/class/thermal/thermal_zone5/temp")
-    battery_temp1 = adb_read(device, "/sys/class/thermal/thermal_zone27/temp")
-    battery_temp2 = adb_read(device, "/sys/class/thermal/thermal_zone28/temp")
+        return empty_result
+
+    capacity_pct = adb_read(device, f"/sys/class/power_supply/{BATTERY_NODE}/capacity")
+    voltage_raw = adb_read(device, f"/sys/class/power_supply/{BATTERY_NODE}/voltage_now")
+    current_raw = adb_read(device, f"/sys/class/power_supply/{BATTERY_NODE}/current_now")
+    battery_temp_raw = adb_read(device, f"/sys/class/power_supply/{BATTERY_NODE}/temp")
+    cpu_temp1_raw = adb_read(device, f"/sys/class/thermal/{CPU1_THERMAL_ZONE}/temp")
+    cpu_temp2_raw = adb_read(device, f"/sys/class/thermal/{CPU2_THERMAL_ZONE}/temp")
 
     if voltage_raw is None or current_raw is None:
-        return {
-            "device": device,
-            "capacity_pct": None,
-            "voltage_mv": None, "current_ma": None,
-            "cpu_temp1": None, "battery_temp1": None, "battery_temp2": None,
-            "status": "NO_DATA"
-        }
+        result = dict(empty_result)
+        result["status"] = "NO_DATA"
+        return result
 
     return {
         "device": device,
         "capacity_pct": capacity_pct,
         "voltage_mv": voltage_raw // 1000,
         "current_ma": current_raw // 1000,
-        "cpu_temp1": cpu_temp1 // 1000 if cpu_temp1 else None,
-        "battery_temp1": battery_temp1 // 1000 if battery_temp1 else None,
-        "battery_temp2": battery_temp2 // 1000 if battery_temp2 else None,
+        # thermal_zone temp обычно в милliградусах -> /1000
+        "cpu_temp1": cpu_temp1_raw // 1000 if cpu_temp1_raw is not None else None,
+        "cpu_temp2": cpu_temp2_raw // 1000 if cpu_temp2_raw is not None else None,
+        # bq27510 temp в десятых долях градуса -> /10
+        "battery_temp": round(battery_temp_raw / 10, 1) if battery_temp_raw is not None else None,
         "status": "OK"
     }
 
 
 def collect_results(futures: dict[Future, str], db_writer: "DatabaseWriter",
                     test_start: datetime, iteration: int) -> None:
-    """
-    Собирает результаты futures без бросания TimeoutError наружу.
+    FUTURE_TIMEOUT = ADB_TIMEOUT_SEC + 5
 
-    Вместо as_completed(..., timeout=X) — который падает если хоть один future
-    завис — используем явный поллинг с индивидуальным таймаутом на каждый future.
-    Зависший future логируется как TIMEOUT и не роняет всю программу.
-    """
-    FUTURE_TIMEOUT = ADB_TIMEOUT_SEC + 5  # секунд на один future
+    def _empty(status: str) -> dict:
+        return {
+            "device": None, "status": status, "capacity_pct": None,
+            "voltage_mv": None, "current_ma": None,
+            "cpu_temp1": None, "cpu_temp2": None, "battery_temp": None
+        }
 
     for future, device in futures.items():
         try:
             result = future.result(timeout=FUTURE_TIMEOUT)
 
-            # Лог только для не-OK или раз в минуту
             if result["status"] != "OK" or iteration % 12 == 0:
                 status_label = "🔴 OFFLINE" if result["status"] == "OFFLINE" else result["status"]
                 log(
                     f"[{device}] {status_label:12s} "
                     f"V={result['voltage_mv']}mV I={result['current_ma']}mA "
-                    f"CPU={result['cpu_temp1']}°C BAT={result['battery_temp1']}°C "
-                    f"SOC={result['capacity_pct']}%"
+                    f"CPU1={result['cpu_temp1']}°C CPU2={result['cpu_temp2']}°C "
+                    f"BAT={result['battery_temp']}°C SOC={result['capacity_pct']}%"
                 )
 
             db_writer.enqueue(device, result, test_start)
 
         except TimeoutError:
-            # future.result() тоже может кинуть TimeoutError — перехватываем здесь
             log(f"[{device}] ⏱ Future timeout, пропускаем итерацию", "warning")
-            db_writer.enqueue(device, {
-                "device": device, "status": "TIMEOUT",  "capacity_pct": None,
-                "voltage_mv": None, "current_ma": None,
-                "cpu_temp1": None, "battery_temp1": None, "battery_temp2": None
-            }, test_start)
+            entry = _empty("TIMEOUT")
+            entry["device"] = device
+            db_writer.enqueue(device, entry, test_start)
 
         except Exception as e:
             log(f"[{device}] ❌ Error: {type(e).__name__}: {e}", "error")
-            db_writer.enqueue(device, {
-                "device": device, "status": "ERROR",  "capacity_pct": None,
-                "voltage_mv": None, "current_ma": None,
-                "cpu_temp1": None, "battery_temp1": None, "battery_temp2": None
-            }, test_start)
+            entry = _empty("ERROR")
+            entry["device"] = device
+            db_writer.enqueue(device, entry, test_start)
 
 
 # ==================== DATABASE WRITER ====================
@@ -330,14 +340,12 @@ class DatabaseWriter:
         }
 
     def start(self) -> threading.Thread:
-        """Запускает фоновый поток записи"""
         thread = threading.Thread(target=self._worker, daemon=True, name="DBWriter")
         thread.start()
         log("📝 Database writer thread started")
         return thread
 
     def enqueue(self, device: str, data: dict, test_start: datetime) -> bool:
-        """Добавляет запись в очередь (не блокирует основной поток)"""
         if self.queue.full():
             log(f"⚠️ Queue full, dropping data for {device}", "warning")
             return False
@@ -353,7 +361,6 @@ class DatabaseWriter:
         return True
 
     def _worker(self) -> None:
-        """Фоновый поток: забирает из очереди и пишет в БД"""
         conn = None
 
         while not self.shutdown_flag or not self.queue.empty():
@@ -383,7 +390,6 @@ class DatabaseWriter:
             finally:
                 self.queue.task_done()
 
-        # Финальный коммит
         if conn:
             try:
                 if self.pending_writes > 0:
@@ -418,8 +424,8 @@ class DatabaseWriter:
 
         conn.execute(f"""
             INSERT INTO "{table}"
-            (timestamp, capacity_pct, voltage_mv, current_ma, cpu_temp1, battery_temp1,
-             battery_temp2, status, test_duration_sec, capacity_mah)
+            (timestamp, capacity_pct, voltage_mv, current_ma, cpu_temp1, cpu_temp2,
+             battery_temp, status, test_duration_sec, capacity_mah)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             timestamp,
@@ -427,8 +433,8 @@ class DatabaseWriter:
             data.get("voltage_mv"),
             data.get("current_ma"),
             data.get("cpu_temp1"),
-            data.get("battery_temp1"),
-            data.get("battery_temp2"),
+            data.get("cpu_temp2"),
+            data.get("battery_temp"),
             data.get("status"),
             duration,
             capacity
@@ -450,7 +456,6 @@ class DatabaseWriter:
 
 # ==================== EXPORT FUNCTIONS ====================
 def export_device_to_csv(db_path: Path, device: str, output_path: Path = None) -> Path:
-    """Экспортирует данные устройства в CSV"""
     import csv
     table = sanitize_table_name(device)
     if output_path is None:
@@ -476,7 +481,6 @@ def export_device_to_csv(db_path: Path, device: str, output_path: Path = None) -
 
 
 def export_all_to_csv(db_path: Path, output_dir: Path = None) -> list[Path]:
-    """Экспортирует все таблицы в отдельные CSV-файлы"""
     if output_dir is None:
         output_dir = db_path.parent / "csv_export"
     output_dir.mkdir(exist_ok=True)
@@ -500,7 +504,6 @@ def export_all_to_csv(db_path: Path, output_dir: Path = None) -> list[Path]:
 
 # ==================== MAIN ====================
 def _graceful_shutdown(db_writer: DatabaseWriter) -> None:
-    """Корректное завершение: ждём записи в БД"""
     log("\n⏹ Получен сигнал остановки...")
     db_writer.shutdown()
     log("⏳ Ожидание завершения записи...")
@@ -513,7 +516,7 @@ def main() -> None:
     global DB_FILE
     DB_FILE = generate_db_filename()
 
-    log(f"🔋 Battery Monitor v2.2 (SQLite, macOS/cross-platform)")
+    log(f"🔋 Battery Monitor v3.0 (bq27510g3-0, SQLite, macOS)")
     log(f"📁 Directory: {BASE_DIR}")
     log(f"🗄️ Database: {DB_FILE.name}")
     log(f"🔧 ADB: {ADB_PATH} (exists: {ADB_PATH.exists()})")
@@ -522,7 +525,6 @@ def main() -> None:
         log(f"❌ ADB not found: {ADB_PATH}", "error")
         log("💡 Установи Android platform-tools:", "error")
         log("   brew install android-platform-tools", "error")
-        log("   ...или положи бинарник adb в ./platform-tools/adb", "error")
         return
 
     ensure_adb_server_running()
@@ -558,7 +560,6 @@ def main() -> None:
     db_writer = DatabaseWriter(DB_FILE, active_devices, POLL_INTERVAL_SEC)
     db_writer.start()
 
-    # Сигналы завершения — не бросают исключений, просто выставляют флаг
     shutdown_requested = threading.Event()
 
     def _signal_handler(signum, frame):
@@ -578,20 +579,15 @@ def main() -> None:
         while not shutdown_requested.is_set():
             iteration += 1
 
-            # ThreadPoolExecutor пересоздаём каждую итерацию — зависшие воркеры
-            # не накапливаются, каждый future живёт не дольше одного цикла
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 futures = {executor.submit(poll_device, d): d for d in active_devices}
                 collect_results(futures, db_writer, test_start, iteration)
-                # executor.__exit__ отменяет незавершённые futures и ждёт воркеров,
-                # но не блокирует дольше естественного завершения потоков
 
             if iteration % 12 == 0:
                 elapsed = (time.time() - start_time) / 60
                 queue_size = db_writer.queue.qsize()
                 log(f"⏱ {elapsed:.1f}min | iter:{iteration} | queue:{queue_size}")
 
-            # sleep с возможностью прерваться по сигналу
             shutdown_requested.wait(timeout=POLL_INTERVAL_SEC)
 
     except Exception as e:
@@ -604,33 +600,6 @@ def main() -> None:
         log("💡 Для экспорта в CSV запустите:")
         log(f'   python -c "from main import export_all_to_csv; export_all_to_csv(\'{DB_FILE}\')"')
 
-
-def launch_app(device: str, package: str) -> bool:
-    """Запускает приложение на устройстве через monkey (не требует знания Activity)"""
-    try:
-        result = subprocess.run(
-            [str(ADB_PATH), "-s", device, "shell", "monkey",
-             "-p", package, "-c", "android.intent.category.LAUNCHER", "1"],
-            capture_output=True, text=True, timeout=15
-        )
-        output = (result.stdout + result.stderr).strip()
-        if result.returncode == 0 and "Events injected: 1" in output:
-            log(f"  ▶️ [{device}] Приложение запущено: {package}")
-            return True
-        else:
-            log(f"  ⚠️ [{device}] Не удалось запустить {package}: {output}", "warning")
-            return False
-    except Exception as e:
-        log(f"  ⚠️ [{device}] Ошибка запуска {package}: {e}", "warning")
-        return False
-
-
-def launch_app_on_all_devices(devices: list[str], package: str) -> None:
-    """Запускает приложение на всех активных устройствах"""
-    log(f"\n--- 📲 Запуск {package} на устройствах ---")
-    for device in devices:
-        launch_app(device, package)
-    log("")
 
 if __name__ == "__main__":
     main()
