@@ -20,7 +20,7 @@ APP_PACKAGE = "com.lockry.loadbattery"
 
 POLL_INTERVAL_SEC = 5
 ADB_TIMEOUT_SEC = 5
-MAX_WORKERS = 5
+MAX_WORKERS = 16
 DB_COMMIT_INTERVAL_SEC = 5
 DB_QUEUE_MAXSIZE = 3000
 
@@ -106,24 +106,38 @@ def log(message: str, level: str = "info") -> None:
     getattr(logger, level)(f"[{ts}] {message}")
 
 
-def launch_app(device: str, package: str) -> bool:
-    """Запускает приложение на устройстве через monkey (не требует знания Activity)"""
-    try:
-        result = subprocess.run(
-            [str(ADB_PATH), "-s", device, "shell", "monkey",
-             "-p", package, "-c", "android.intent.category.LAUNCHER", "1"],
-            capture_output=True, text=True, timeout=15
-        )
-        output = (result.stdout + result.stderr).strip()
-        if result.returncode == 0 and "Events injected: 1" in output:
-            log(f"  ▶️ [{device}] Приложение запущено: {package}")
-            return True
-        else:
+def launch_app(device: str, package: str, retries: int = 3, retry_delay: float = 2.0) -> bool:
+    """Запускает приложение на устройстве через monkey, с повторами если adb видит offline
+    (частая ситуация сразу после adb connect, пока транспорт не устоялся)"""
+    for attempt in range(1, retries + 1):
+        try:
+            result = subprocess.run(
+                [str(ADB_PATH), "-s", device, "shell", "monkey",
+                 "-p", package, "-c", "android.intent.category.LAUNCHER", "1"],
+                capture_output=True, text=True, timeout=15
+            )
+            output = (result.stdout + result.stderr).strip()
+
+            if result.returncode == 0 and "Events injected: 1" in output:
+                log(f"  ▶️ [{device}] Приложение запущено: {package}")
+                return True
+
+            if "device offline" in output.lower() and attempt < retries:
+                log(f"  ⏳ [{device}] Устройство ещё не готово, повтор {attempt}/{retries}...")
+                time.sleep(retry_delay)
+                continue
+
             log(f"  ⚠️ [{device}] Не удалось запустить {package}: {output}", "warning")
             return False
-    except Exception as e:
-        log(f"  ⚠️ [{device}] Ошибка запуска {package}: {e}", "warning")
-        return False
+
+        except Exception as e:
+            if attempt < retries:
+                time.sleep(retry_delay)
+                continue
+            log(f"  ⚠️ [{device}] Ошибка запуска {package}: {e}", "warning")
+            return False
+
+    return False
 
 
 def launch_app_on_all_devices(devices: list[str], package: str) -> None:
@@ -571,6 +585,9 @@ def main() -> None:
     if not active_devices:
         log("❌ No devices connected", "error")
         return
+
+    log("⏳ Даём adb-транспорту стабилизироваться...")
+    time.sleep(3)
 
     launch_app_on_all_devices(active_devices, APP_PACKAGE)
 
