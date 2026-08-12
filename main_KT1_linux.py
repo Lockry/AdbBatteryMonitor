@@ -251,35 +251,22 @@ def load_devices() -> list[str]:
     return devices
 
 
-def is_device_connected(device: str) -> bool:
-    """Проверяет доступность устройства"""
-    try:
-        result = subprocess.run(
-            [str(ADB_PATH), "-s", device, "shell", "echo", "ok"],
-            capture_output=True, text=True, timeout=ADB_TIMEOUT_SEC
-        )
-        return result.returncode == 0 and result.stdout.strip() == "ok"
-    except Exception:
-        return False
-
-
-def adb_read(device: str, path: str) -> int | None:
-    """Читает число из системного файла на устройстве"""
-    try:
-        result = subprocess.run(
-            [str(ADB_PATH), "-s", device, "shell", "cat", path],
-            capture_output=True, text=True, timeout=ADB_TIMEOUT_SEC
-        )
-        if result.returncode != 0:
-            return None
-        value = result.stdout.strip()
-        return int(value) if value else None
-    except (subprocess.TimeoutExpired, ValueError, Exception):
+def parse_int(line: str) -> int | None:
+    """Парсит целое число (в т.ч. отрицательное) из строки, иначе None"""
+    line = line.strip()
+    if not line:
         return None
+    if line.lstrip("-").isdigit():
+        return int(line)
+    return None
 
 
 def poll_device(device: str) -> dict:
-    """Опрашивает устройство и возвращает метрики"""
+    """
+    Опрашивает устройство ОДНИМ adb-вызовом вместо 7 (было: проверка связи + 6 отдельных cat).
+    Это критично при большом количестве устройств (16+) — 7 последовательных
+    вызовов на каждое устройство легко превышают тайминги при параллельном опросе.
+    """
     empty_result = {
         "device": device,
         "capacity_pct": None,
@@ -288,20 +275,49 @@ def poll_device(device: str) -> dict:
         "status": "OFFLINE"
     }
 
-    if not is_device_connected(device):
+    paths = [
+        f"/sys/class/power_supply/{BATTERY_NODE}/capacity",
+        f"/sys/class/power_supply/{BATTERY_NODE}/voltage_now",
+        f"/sys/class/power_supply/{BATTERY_NODE}/current_now",
+        f"/sys/class/power_supply/{BATTERY_NODE}/temp",
+        f"/sys/class/thermal/{CPU1_THERMAL_ZONE}/temp",
+        f"/sys/class/thermal/{CPU2_THERMAL_ZONE}/temp",
+    ]
+    # Каждый cat на своей строке вывода; если файла нет — пишем NONE, чтобы не сбить порядок строк
+    cmd_str = " ; ".join(f"cat {p} 2>/dev/null || echo NONE" for p in paths)
+
+    result = None
+    for attempt in range(2):  # 1 попытка + 1 быстрый повтор при сбое
+        try:
+            result = subprocess.run(
+                [str(ADB_PATH), "-s", device, "shell", cmd_str],
+                capture_output=True, text=True, timeout=ADB_TIMEOUT_SEC
+            )
+            if result.returncode == 0:
+                break
+        except Exception:
+            result = None
+
+    if result is None or result.returncode != 0:
         return empty_result
 
-    capacity_pct = adb_read(device, f"/sys/class/power_supply/{BATTERY_NODE}/capacity")
-    voltage_raw = adb_read(device, f"/sys/class/power_supply/{BATTERY_NODE}/voltage_now")
-    current_raw = adb_read(device, f"/sys/class/power_supply/{BATTERY_NODE}/current_now")
-    battery_temp_raw = adb_read(device, f"/sys/class/power_supply/{BATTERY_NODE}/temp")
-    cpu_temp1_raw = adb_read(device, f"/sys/class/thermal/{CPU1_THERMAL_ZONE}/temp")
-    cpu_temp2_raw = adb_read(device, f"/sys/class/thermal/{CPU2_THERMAL_ZONE}/temp")
+    lines = result.stdout.strip().splitlines()
+    if len(lines) < len(paths):
+        result_data = dict(empty_result)
+        result_data["status"] = "NO_DATA"
+        return result_data
+
+    capacity_pct = parse_int(lines[0])
+    voltage_raw = parse_int(lines[1])
+    current_raw = parse_int(lines[2])
+    battery_temp_raw = parse_int(lines[3])
+    cpu_temp1_raw = parse_int(lines[4])
+    cpu_temp2_raw = parse_int(lines[5])
 
     if voltage_raw is None or current_raw is None:
-        result = dict(empty_result)
-        result["status"] = "NO_DATA"
-        return result
+        result_data = dict(empty_result)
+        result_data["status"] = "NO_DATA"
+        return result_data
 
     return {
         "device": device,

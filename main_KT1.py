@@ -18,7 +18,7 @@ APP_PACKAGE = "com.lockry.loadbattery"
 
 POLL_INTERVAL_SEC = 5
 ADB_TIMEOUT_SEC = 5
-MAX_WORKERS = 5
+MAX_WORKERS = 16          # было 5 — теперь под все устройства сразу, без очереди
 DB_COMMIT_INTERVAL_SEC = 5
 DB_QUEUE_MAXSIZE = 3000
 
@@ -29,32 +29,6 @@ BATTERY_NODE = "bq27510g3-0"
 CPU1_THERMAL_ZONE = "thermal_zone10"   # tsens_tz_sensor6
 CPU2_THERMAL_ZONE = "thermal_zone20"   # pm8953_tz
 
-def launch_app(device: str, package: str) -> bool:
-    """Запускает приложение на устройстве через monkey (не требует знания Activity)"""
-    try:
-        result = subprocess.run(
-            [str(ADB_PATH), "-s", device, "shell", "monkey",
-             "-p", package, "-c", "android.intent.category.LAUNCHER", "1"],
-            capture_output=True, text=True, timeout=15
-        )
-        output = (result.stdout + result.stderr).strip()
-        if result.returncode == 0 and "Events injected: 1" in output:
-            log(f"  ▶️ [{device}] Приложение запущено: {package}")
-            return True
-        else:
-            log(f"  ⚠️ [{device}] Не удалось запустить {package}: {output}", "warning")
-            return False
-    except Exception as e:
-        log(f"  ⚠️ [{device}] Ошибка запуска {package}: {e}", "warning")
-        return False
-
-
-def launch_app_on_all_devices(devices: list[str], package: str) -> None:
-    """Запускает приложение на всех активных устройствах"""
-    log(f"\n--- 📲 Запуск {package} на устройствах ---")
-    for device in devices:
-        launch_app(device, package)
-    log("")
 
 def generate_db_filename() -> Path:
     ts = datetime.now().strftime("%d%m_%H%M")
@@ -80,6 +54,48 @@ def log(message: str, level: str = "info") -> None:
     if level == "warn":
         level = "warning"
     getattr(logger, level)(f"[{ts}] {message}")
+
+
+def launch_app(device: str, package: str, retries: int = 3, retry_delay: float = 2.0) -> bool:
+    """Запускает приложение на устройстве через monkey, с повторами если adb видит offline
+    (частая ситуация сразу после adb connect, пока транспорт не устоялся)"""
+    for attempt in range(1, retries + 1):
+        try:
+            result = subprocess.run(
+                [str(ADB_PATH), "-s", device, "shell", "monkey",
+                 "-p", package, "-c", "android.intent.category.LAUNCHER", "1"],
+                capture_output=True, text=True, timeout=15
+            )
+            output = (result.stdout + result.stderr).strip()
+
+            if result.returncode == 0 and "Events injected: 1" in output:
+                log(f"  ▶️ [{device}] Приложение запущено: {package}")
+                return True
+
+            if "device offline" in output.lower() and attempt < retries:
+                log(f"  ⏳ [{device}] Устройство ещё не готово, повтор {attempt}/{retries}...")
+                time.sleep(retry_delay)
+                continue
+
+            log(f"  ⚠️ [{device}] Не удалось запустить {package}: {output}", "warning")
+            return False
+
+        except Exception as e:
+            if attempt < retries:
+                time.sleep(retry_delay)
+                continue
+            log(f"  ⚠️ [{device}] Ошибка запуска {package}: {e}", "warning")
+            return False
+
+    return False
+
+
+def launch_app_on_all_devices(devices: list[str], package: str) -> None:
+    """Запускает приложение на всех активных устройствах"""
+    log(f"\n--- 📲 Запуск {package} на устройствах ---")
+    for device in devices:
+        launch_app(device, package)
+    log("")
 
 
 # ==================== SQLITE HELPERS ====================
@@ -185,35 +201,22 @@ def load_devices() -> list[str]:
     return devices
 
 
-def is_device_connected(device: str) -> bool:
-    """Проверяет доступность устройства"""
-    try:
-        result = subprocess.run(
-            [str(ADB_PATH), "-s", device, "shell", "echo", "ok"],
-            capture_output=True, text=True, timeout=ADB_TIMEOUT_SEC
-        )
-        return result.returncode == 0 and result.stdout.strip() == "ok"
-    except Exception:
-        return False
-
-
-def adb_read(device: str, path: str) -> int | None:
-    """Читает число из системного файла на устройстве"""
-    try:
-        result = subprocess.run(
-            [str(ADB_PATH), "-s", device, "shell", "cat", path],
-            capture_output=True, text=True, timeout=ADB_TIMEOUT_SEC
-        )
-        if result.returncode != 0:
-            return None
-        value = result.stdout.strip()
-        return int(value) if value else None
-    except (subprocess.TimeoutExpired, ValueError, Exception):
+def parse_int(line: str) -> int | None:
+    """Парсит целое число (в т.ч. отрицательное) из строки, иначе None"""
+    line = line.strip()
+    if not line:
         return None
+    if line.lstrip("-").isdigit():
+        return int(line)
+    return None
 
 
 def poll_device(device: str) -> dict:
-    """Опрашивает устройство и возвращает метрики"""
+    """
+    Опрашивает устройство ОДНИМ adb-вызовом вместо 7 (было: проверка связи + 6 отдельных cat).
+    Это критично при большом количестве устройств — 7 последовательных вызовов
+    на каждое устройство легко превышают тайминги, особенно если хоть один зависает.
+    """
     empty_result = {
         "device": device,
         "capacity_pct": None,
@@ -222,20 +225,53 @@ def poll_device(device: str) -> dict:
         "status": "OFFLINE"
     }
 
-    if not is_device_connected(device):
+    paths = [
+        f"/sys/class/power_supply/{BATTERY_NODE}/capacity",
+        f"/sys/class/power_supply/{BATTERY_NODE}/voltage_now",
+        f"/sys/class/power_supply/{BATTERY_NODE}/current_now",
+        f"/sys/class/power_supply/{BATTERY_NODE}/temp",
+        f"/sys/class/thermal/{CPU1_THERMAL_ZONE}/temp",
+        f"/sys/class/thermal/{CPU2_THERMAL_ZONE}/temp",
+    ]
+    # Каждый cat на своей строке вывода; если файла нет — пишем NONE, чтобы не сбить порядок строк
+    cmd_str = " ; ".join(f"cat {p} 2>/dev/null || echo NONE" for p in paths)
+
+    result = None
+    RETRIES = 3  # 1 попытка + 2 повтора — покрывает более длинные Wi-Fi микро-обрывы
+    for attempt in range(RETRIES):
+        try:
+            result = subprocess.run(
+                [str(ADB_PATH), "-s", device, "shell", cmd_str],
+                capture_output=True, text=True, timeout=ADB_TIMEOUT_SEC
+            )
+            if result.returncode == 0:
+                break
+        except Exception:
+            result = None
+
+        if attempt < RETRIES - 1:
+            time.sleep(0.5)  # короткая пауза перед повтором — даём сети "отдышаться"
+
+    if result is None or result.returncode != 0:
         return empty_result
 
-    capacity_pct = adb_read(device, f"/sys/class/power_supply/{BATTERY_NODE}/capacity")
-    voltage_raw = adb_read(device, f"/sys/class/power_supply/{BATTERY_NODE}/voltage_now")
-    current_raw = adb_read(device, f"/sys/class/power_supply/{BATTERY_NODE}/current_now")
-    battery_temp_raw = adb_read(device, f"/sys/class/power_supply/{BATTERY_NODE}/temp")
-    cpu_temp1_raw = adb_read(device, f"/sys/class/thermal/{CPU1_THERMAL_ZONE}/temp")
-    cpu_temp2_raw = adb_read(device, f"/sys/class/thermal/{CPU2_THERMAL_ZONE}/temp")
+    lines = result.stdout.strip().splitlines()
+    if len(lines) < len(paths):
+        result_data = dict(empty_result)
+        result_data["status"] = "NO_DATA"
+        return result_data
+
+    capacity_pct = parse_int(lines[0])
+    voltage_raw = parse_int(lines[1])
+    current_raw = parse_int(lines[2])
+    battery_temp_raw = parse_int(lines[3])
+    cpu_temp1_raw = parse_int(lines[4])
+    cpu_temp2_raw = parse_int(lines[5])
 
     if voltage_raw is None or current_raw is None:
-        result = dict(empty_result)
-        result["status"] = "NO_DATA"
-        return result
+        result_data = dict(empty_result)
+        result_data["status"] = "NO_DATA"
+        return result_data
 
     return {
         "device": device,
@@ -253,7 +289,7 @@ def poll_device(device: str) -> dict:
 
 def collect_results(futures: dict[Future, str], db_writer: "DatabaseWriter",
                     test_start: datetime, iteration: int) -> None:
-    FUTURE_TIMEOUT = ADB_TIMEOUT_SEC + 5  # секунд на один future
+    FUTURE_TIMEOUT = ADB_TIMEOUT_SEC * 3 + 5  # запас под 3 попытки внутри poll_device + буфер
 
     def _empty(status: str) -> dict:
         return {
@@ -489,7 +525,7 @@ def main() -> None:
     global DB_FILE
     DB_FILE = generate_db_filename()
 
-    log(f"🔋 Battery Monitor v3.0 (bq27510g3-0, SQLite, Windows)")
+    log(f"🔋 Battery Monitor v3.1 (bq27510g3-0, SQLite, Windows)")
     log(f"📁 Directory: {BASE_DIR}")
     log(f"🗄️ Database: {DB_FILE.name}")
     log(f"🔧 ADB: {ADB_PATH} (exists: {ADB_PATH.exists()})")
@@ -513,12 +549,14 @@ def main() -> None:
     connection_status = connect_to_all_devices(devices)
     active_devices = [d for d in devices if connection_status.get(d)]
 
-    launch_app_on_all_devices(active_devices, APP_PACKAGE)
-
-
     if not active_devices:
         log("❌ No devices connected", "error")
         return
+
+    log("⏳ Даём adb-транспорту стабилизироваться...")
+    time.sleep(3)
+
+    launch_app_on_all_devices(active_devices, APP_PACKAGE)
 
     if DB_FILE.exists():
         log(f"🗑️ Удаляем старую БД: {DB_FILE.name}")
@@ -571,7 +609,6 @@ def main() -> None:
         log(f"\n💡 Данные сохранены в: {DB_FILE}")
         log("💡 Для экспорта в CSV запустите:")
         log(f'   python -c "from main import export_all_to_csv; export_all_to_csv(\'{DB_FILE}\')"')
-
 
 
 if __name__ == "__main__":
