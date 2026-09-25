@@ -216,7 +216,7 @@ def is_device_connected(device: str) -> bool:
         return False
 
 
-def adb_read(device: str, path: str) -> int | None:
+def adb_read(device: str, path: str) -> int:
     """Читает число из системного файла на устройстве"""
     try:
         result = subprocess.run(
