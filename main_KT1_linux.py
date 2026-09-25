@@ -5,6 +5,8 @@ import signal
 import sqlite3
 import logging
 import re
+import os
+import stat
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
@@ -18,16 +20,64 @@ APP_PACKAGE = "com.lockry.loadbattery"
 
 POLL_INTERVAL_SEC = 5
 ADB_TIMEOUT_SEC = 5
-MAX_WORKERS = 16          # было 5 — теперь под все устройства сразу, без очереди
+MAX_WORKERS = 16
 DB_COMMIT_INTERVAL_SEC = 5
 DB_QUEUE_MAXSIZE = 3000
-
-ADB_PATH = BASE_DIR / "platform-tools" / "adb.exe"
 
 # Пути специфичные для этого устройства (bq27510g3-0 fuel gauge)
 BATTERY_NODE = "bq27510g3-0"
 CPU1_THERMAL_ZONE = "thermal_zone10"   # tsens_tz_sensor6
 CPU2_THERMAL_ZONE = "thermal_zone20"   # pm8953_tz
+
+
+def resolve_adb_path() -> Path:
+    """
+    Ищет adb в трёх местах (в порядке приоритета):
+      1) ./platform-tools-linux/adb рядом со скриптом
+      2) $ANDROID_HOME/platform-tools/adb или $ANDROID_SDK_ROOT/platform-tools/adb
+      3) adb, найденный в PATH
+    """
+    binary_name = "adb"
+
+    local_candidate = BASE_DIR / "platform-tools-linux" / binary_name
+    if local_candidate.exists():
+        return local_candidate
+
+    for env_var in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        sdk_root = os.environ.get(env_var)
+        if sdk_root:
+            candidate = Path(sdk_root) / "platform-tools" / binary_name
+            if candidate.exists():
+                return candidate
+
+    which_result = shutil_which(binary_name)
+    if which_result:
+        return Path(which_result)
+
+    # Ничего не нашли — возвращаем локальный путь как дефолт,
+    # чтобы дальше сработала понятная проверка ADB_PATH.exists()
+    return local_candidate
+
+
+def shutil_which(binary_name: str):
+    import shutil
+    return shutil.which(binary_name)
+
+
+def ensure_executable(path: Path) -> None:
+    """На Linux/macOS бинарник adb должен иметь бит на исполнение."""
+    try:
+        if path.exists():
+            current_mode = path.stat().st_mode
+            if not (current_mode & stat.S_IXUSR):
+                path.chmod(current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    except Exception:
+        # Не критично — если прав не хватит, subprocess сам упадёт с понятной ошибкой
+        pass
+
+
+ADB_PATH = resolve_adb_path()
+ensure_executable(ADB_PATH)
 
 
 def generate_db_filename() -> Path:
@@ -214,8 +264,8 @@ def parse_int(line: str) -> int | None:
 def poll_device(device: str) -> dict:
     """
     Опрашивает устройство ОДНИМ adb-вызовом вместо 7 (было: проверка связи + 6 отдельных cat).
-    Это критично при большом количестве устройств — 7 последовательных вызовов
-    на каждое устройство легко превышают тайминги, особенно если хоть один зависает.
+    Это критично при большом количестве устройств (16+) — 7 последовательных
+    вызовов на каждое устройство легко превышают тайминги при параллельном опросе.
     """
     empty_result = {
         "device": device,
@@ -237,8 +287,7 @@ def poll_device(device: str) -> dict:
     cmd_str = " ; ".join(f"cat {p} 2>/dev/null || echo NONE" for p in paths)
 
     result = None
-    RETRIES = 3  # 1 попытка + 2 повтора — покрывает более длинные Wi-Fi микро-обрывы
-    for attempt in range(RETRIES):
+    for attempt in range(2):  # 1 попытка + 1 быстрый повтор при сбое
         try:
             result = subprocess.run(
                 [str(ADB_PATH), "-s", device, "shell", cmd_str],
@@ -248,9 +297,6 @@ def poll_device(device: str) -> dict:
                 break
         except Exception:
             result = None
-
-        if attempt < RETRIES - 1:
-            time.sleep(0.5)  # короткая пауза перед повтором — даём сети "отдышаться"
 
     if result is None or result.returncode != 0:
         return empty_result
@@ -289,7 +335,7 @@ def poll_device(device: str) -> dict:
 
 def collect_results(futures: dict[Future, str], db_writer: "DatabaseWriter",
                     test_start: datetime, iteration: int) -> None:
-    FUTURE_TIMEOUT = ADB_TIMEOUT_SEC * 3 + 5  # запас под 3 попытки внутри poll_device + буфер
+    FUTURE_TIMEOUT = ADB_TIMEOUT_SEC + 5  # секунд на один future
 
     def _empty(status: str) -> dict:
         return {
@@ -525,13 +571,16 @@ def main() -> None:
     global DB_FILE
     DB_FILE = generate_db_filename()
 
-    log(f"🔋 Battery Monitor v3.1 (bq27510g3-0, SQLite, Windows)")
+    log(f"🔋 Battery Monitor v3.0 (bq27510g3-0, SQLite, Linux)")
     log(f"📁 Directory: {BASE_DIR}")
     log(f"🗄️ Database: {DB_FILE.name}")
     log(f"🔧 ADB: {ADB_PATH} (exists: {ADB_PATH.exists()})")
 
     if not ADB_PATH.exists():
         log(f"❌ ADB not found: {ADB_PATH}", "error")
+        log("💡 Установи Android platform-tools:", "error")
+        log("   sudo apt install android-tools-adb", "error")
+        log("   ...или положи бинарник adb в ./platform-tools-linux/adb", "error")
         return
 
     ensure_adb_server_running()
